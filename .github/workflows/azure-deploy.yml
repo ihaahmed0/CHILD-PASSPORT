@@ -53,9 +53,15 @@ jobs:
       with:
         creds: ${{ secrets.AZURE_CREDENTIALS }}
     
-    - name: Deploy to Azure Web App
+    - name: Configure Azure to install dependencies
       run: |
-        az webapp deployment source config-zip \
+        az webapp config appsettings set \
           --resource-group ${{ env.RESOURCE_GROUP }} \
           --name ${{ env.AZURE_WEBAPP_NAME }} \
-          --src deployment.zip
+          --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
+    
+    - name: Deploy to Azure Web App
+      uses: azure/webapps-deploy@v2
+      with:
+        app-name: ${{ env.AZURE_WEBAPP_NAME }}
+        package: deployment.zip
