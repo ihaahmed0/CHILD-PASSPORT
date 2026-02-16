@@ -1,7 +1,9 @@
 from django.urls import path
+from . import views
 
 app_name = 'accounts'
 
 urlpatterns = [
-    # Authentication endpoints will be added here
+    path('login/', views.login_view, name='login'),
+    path('me/', views.me_view, name='me'),
 ]
