@@ -49,7 +49,7 @@ jobs:
     - name: Deploy to Azure Web App
       uses: azure/webapps-deploy@v2
       with:
-        app-name: 'django-web-app-914b2d44'  # ⚠️ REPLACE with your actual web app name from Phase 3
+        app-name: 'django-web-app-914b2d44'
         publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
         package: deployment.zip
     
