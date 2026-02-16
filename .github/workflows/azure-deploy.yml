@@ -24,20 +24,13 @@ jobs:
       with:
         python-version: ${{ env.PYTHON_VERSION }}
     
-    - name: Create virtual environment
-      run: |
-        python -m venv venv
-        source venv/bin/activate
-    
     - name: Install dependencies
       run: |
-        source venv/bin/activate
-        pip install --upgrade pip
+        python -m pip install --upgrade pip
         pip install -r requirements.txt
     
     - name: Collect static files
       run: |
-        source venv/bin/activate
         python manage.py collectstatic --noinput
       env:
         SECRET_KEY: ${{ secrets.SECRET_KEY }}
@@ -46,22 +39,56 @@ jobs:
     
     - name: Create deployment package
       run: |
-        zip -r deployment.zip . -x "*.git*" "venv/*" "*.pyc" "__pycache__/*" "db.sqlite3"
+        zip -r deployment.zip . \
+          -x "*.git*" \
+          -x "venv/*" \
+          -x "*.pyc" \
+          -x "__pycache__/*" \
+          -x "db.sqlite3" \
+          -x ".env"
     
     - name: Login to Azure
       uses: azure/login@v1
       with:
         creds: ${{ secrets.AZURE_CREDENTIALS }}
     
-    - name: Configure Azure to install dependencies
+    - name: Set Web App to build during deployment
       run: |
         az webapp config appsettings set \
           --resource-group ${{ env.RESOURCE_GROUP }} \
           --name ${{ env.AZURE_WEBAPP_NAME }} \
-          --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
+          --settings \
+            SCM_DO_BUILD_DURING_DEPLOYMENT=true \
+            ENABLE_ORYX_BUILD=true
     
     - name: Deploy to Azure Web App
-      uses: azure/webapps-deploy@v2
-      with:
-        app-name: ${{ env.AZURE_WEBAPP_NAME }}
-        package: deployment.zip
+      run: |
+        az webapp deployment source config-zip \
+          --resource-group ${{ env.RESOURCE_GROUP }} \
+          --name ${{ env.AZURE_WEBAPP_NAME }} \
+          --src deployment.zip
+    
+    - name: Wait for deployment to complete
+      run: sleep 90
+    
+    - name: Run database migrations
+      run: |
+        echo "Running migrations on Azure..."
+        az webapp ssh \
+          --resource-group ${{ env.RESOURCE_GROUP }} \
+          --name ${{ env.AZURE_WEBAPP_NAME }} \
+          --command "cd /home/site/wwwroot && python manage.py migrate --noinput"
+    
+    - name: Seed assessment categories (if needed)
+      run: |
+        echo "Seeding assessment categories..."
+        az webapp ssh \
+          --resource-group ${{ env.RESOURCE_GROUP }} \
+          --name ${{ env.AZURE_WEBAPP_NAME }} \
+          --command "cd /home/site/wwwroot && python manage.py seed_assessment_categories" || echo "Categories already seeded or command failed"
+    
+    - name: Restart Web App
+      run: |
+        az webapp restart \
+          --resource-group ${{ env.RESOURCE_GROUP }} \
+          --name ${{ env.AZURE_WEBAPP_NAME }}
