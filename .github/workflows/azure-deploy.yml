@@ -8,6 +8,8 @@ on:
 
 env:
   PYTHON_VERSION: '3.11'
+  AZURE_WEBAPP_NAME: 'django-web-app-914b2d44'
+  RESOURCE_GROUP: 'django-app-rg'
 
 jobs:
   build-and-deploy:
@@ -44,16 +46,16 @@ jobs:
     
     - name: Create deployment package
       run: |
-        zip -r deployment.zip . -x "*.git*" "venv/*" "*.pyc" "__pycache__/*"
+        zip -r deployment.zip . -x "*.git*" "venv/*" "*.pyc" "__pycache__/*" "db.sqlite3"
+    
+    - name: Login to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
     
     - name: Deploy to Azure Web App
-      uses: azure/webapps-deploy@v2
-      with:
-        app-name: 'django-web-app-914b2d44'
-        publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
-        package: deployment.zip
-    
-    - name: Run database migrations
       run: |
-        # This will run migrations on Azure after deployment
-        echo "Migrations will run on first request or via Azure SSH console"
+        az webapp deployment source config-zip \
+          --resource-group ${{ env.RESOURCE_GROUP }} \
+          --name ${{ env.AZURE_WEBAPP_NAME }} \
+          --src deployment.zip
