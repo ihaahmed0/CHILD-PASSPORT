@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     'drf_spectacular', 
     'accounts',
     'schools',
+    'children',
 ]
 # Custom User Model
 AUTH_USER_MODEL = 'accounts.User'
@@ -183,6 +184,7 @@ STATICFILES_DIRS = [BASE_DIR / 'static']
 # Media files (User uploads)
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+os.makedirs(MEDIA_ROOT, exist_ok=True)
 
 # WhiteNoise configuration for static files
 MIDDLEWARE.insert(1, 'whitenoise.middleware.WhiteNoiseMiddleware')
@@ -192,3 +194,5 @@ STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
