@@ -12,8 +12,17 @@ else
     source /home/site/wwwroot/antenv/bin/activate
 fi
 
-# Run migrations
-python /home/site/wwwroot/manage.py migrate --noinput
+cd /home/site/wwwroot
 
-# Start Gunicorn
-gunicorn --bind=0.0.0.0 --timeout 600 --chdir /home/site/wwwroot childpassport.wsgi
+echo "Running migrations..."
+python manage.py migrate --noinput
+
+echo "Seeding assessment categories..."
+python manage.py seed_assessment_categories || true
+
+echo "Collecting static files..."
+python manage.py collectstatic --noinput || true
+
+echo "Starting Gunicorn..."
+gunicorn --bind=0.0.0.0 --timeout 600 childpassport.wsgi
+

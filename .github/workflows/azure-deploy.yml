@@ -66,24 +66,9 @@ jobs:
         app-name: ${{ env.AZURE_WEBAPP_NAME }}
         package: deployment.zip
 
-    - name: Run database migrations
-      run: |
-        echo "Running migrations on Azure..."
-        az webapp ssh \
-          --resource-group ${{ env.RESOURCE_GROUP }} \
-          --name ${{ env.AZURE_WEBAPP_NAME }} \
-          --command "cd /home/site/wwwroot && python manage.py migrate --noinput"
-    
-    - name: Seed assessment categories (if needed)
-      run: |
-        echo "Seeding assessment categories..."
-        az webapp ssh \
-          --resource-group ${{ env.RESOURCE_GROUP }} \
-          --name ${{ env.AZURE_WEBAPP_NAME }} \
-          --command "cd /home/site/wwwroot && python manage.py seed_assessment_categories" || echo "Categories already seeded or command failed"
-    
     - name: Restart Web App
       run: |
+        echo "Restarting web app to apply changes..."
         az webapp restart \
           --resource-group ${{ env.RESOURCE_GROUP }} \
           --name ${{ env.AZURE_WEBAPP_NAME }}
