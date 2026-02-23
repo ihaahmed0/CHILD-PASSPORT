@@ -24,20 +24,13 @@ jobs:
       with:
         python-version: ${{ env.PYTHON_VERSION }}
     
-    - name: Create virtual environment
-      run: |
-        python -m venv venv
-        source venv/bin/activate
-    
     - name: Install dependencies
       run: |
-        source venv/bin/activate
-        pip install --upgrade pip
+        python -m pip install --upgrade pip
         pip install -r requirements.txt
     
     - name: Collect static files
       run: |
-        source venv/bin/activate
         python manage.py collectstatic --noinput
       env:
         SECRET_KEY: ${{ secrets.SECRET_KEY }}
@@ -46,29 +39,50 @@ jobs:
     
     - name: Create deployment package
       run: |
-        zip -r deployment.zip . -x "*.git*" "venv/*" "*.pyc" "__pycache__/*" "db.sqlite3"
+        zip -r deployment.zip . \
+          -x "*.git*" \
+          -x "venv/*" \
+          -x "*.pyc" \
+          -x "__pycache__/*" \
+          -x "db.sqlite3" \
+          -x ".env" \
+          -x ".DS_Store"
     
     - name: Login to Azure
       uses: azure/login@v1
       with:
         creds: ${{ secrets.AZURE_CREDENTIALS }}
     
-    - name: Configure Azure to install dependencies
+    - name: Configure startup script
+      run: |
+        az webapp config set \
+          --resource-group ${{ env.RESOURCE_GROUP }} \
+          --name ${{ env.AZURE_WEBAPP_NAME }} \
+          --startup-file "bash startup.sh"
+    
+    - name: Configure Azure build settings
       run: |
         az webapp config appsettings set \
           --resource-group ${{ env.RESOURCE_GROUP }} \
           --name ${{ env.AZURE_WEBAPP_NAME }} \
-          --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
+          --settings \
+            SCM_DO_BUILD_DURING_DEPLOYMENT=true \
+            ENABLE_ORYX_BUILD=true \
+            WEBSITE_RUN_FROM_PACKAGE=0
     
     - name: Deploy to Azure Web App
-      uses: azure/webapps-deploy@v2
-      with:
-        app-name: ${{ env.AZURE_WEBAPP_NAME }}
-        package: deployment.zip
-
+      run: |
+        az webapp deployment source config-zip \
+          --resource-group ${{ env.RESOURCE_GROUP }} \
+          --name ${{ env.AZURE_WEBAPP_NAME }} \
+          --src deployment.zip
+    
+    - name: Wait for deployment
+      run: sleep 60
+    
     - name: Restart Web App
       run: |
-        echo "Restarting web app to apply changes..."
+        echo "Restarting web app to apply changes and run migrations..."
         az webapp restart \
           --resource-group ${{ env.RESOURCE_GROUP }} \
           --name ${{ env.AZURE_WEBAPP_NAME }}
