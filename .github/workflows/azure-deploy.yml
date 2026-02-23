@@ -42,47 +42,50 @@ jobs:
         zip -r deployment.zip . \
           -x "*.git*" \
           -x "venv/*" \
+          -x "env/*" \
           -x "*.pyc" \
           -x "__pycache__/*" \
           -x "db.sqlite3" \
-          -x ".env" \
-          -x ".DS_Store"
+          -x ".env*" \
+          -x ".DS_Store" \
+          -x "*.md" \
+          -x ".vscode/*" \
+          -x ".idea/*"
     
     - name: Login to Azure
       uses: azure/login@v1
       with:
         creds: ${{ secrets.AZURE_CREDENTIALS }}
     
-    - name: Configure startup script
-      run: |
-        az webapp config set \
-          --resource-group ${{ env.RESOURCE_GROUP }} \
-          --name ${{ env.AZURE_WEBAPP_NAME }} \
-          --startup-file "bash startup.sh"
-    
-    - name: Configure Azure build settings
+    - name: Disable Azure build (use pre-built package)
       run: |
         az webapp config appsettings set \
           --resource-group ${{ env.RESOURCE_GROUP }} \
           --name ${{ env.AZURE_WEBAPP_NAME }} \
           --settings \
-            SCM_DO_BUILD_DURING_DEPLOYMENT=true \
-            ENABLE_ORYX_BUILD=true \
+            SCM_DO_BUILD_DURING_DEPLOYMENT=false \
+            ENABLE_ORYX_BUILD=false \
             WEBSITE_RUN_FROM_PACKAGE=0
     
-    - name: Deploy to Azure Web App
+    - name: Set startup command directly
       run: |
-        az webapp deployment source config-zip \
+        az webapp config set \
           --resource-group ${{ env.RESOURCE_GROUP }} \
           --name ${{ env.AZURE_WEBAPP_NAME }} \
-          --src deployment.zip
+          --startup-file "python manage.py migrate --noinput && gunicorn --bind=0.0.0.0 --timeout 600 childpassport.wsgi"
     
-    - name: Wait for deployment
-      run: sleep 60
+    - name: Deploy to Azure Web App (using az deploy)
+      run: |
+        az webapp deploy \
+          --resource-group ${{ env.RESOURCE_GROUP }} \
+          --name ${{ env.AZURE_WEBAPP_NAME }} \
+          --src-path deployment.zip \
+          --type zip \
+          --async false
     
     - name: Restart Web App
       run: |
-        echo "Restarting web app to apply changes and run migrations..."
+        echo "Restarting web app..."
         az webapp restart \
           --resource-group ${{ env.RESOURCE_GROUP }} \
           --name ${{ env.AZURE_WEBAPP_NAME }}
