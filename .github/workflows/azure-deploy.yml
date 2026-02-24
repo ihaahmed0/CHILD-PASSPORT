@@ -1,4 +1,5 @@
-name: Deploy Django to Azure App Service
+# Build and deploy Django app to Azure Web App
+name: Build and deploy Python app to Azure Web App - child-passport
 
 on:
   push:
@@ -6,69 +7,69 @@ on:
       - master
   workflow_dispatch:
 
-env:
-  PYTHON_VERSION: '3.11'
-  AZURE_WEBAPP_NAME: 'django-web-app-914b2d44'
-  RESOURCE_GROUP: 'django-app-rg'
-
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ env.PYTHON_VERSION }}
-    
-    - name: Create virtual environment
-      run: |
-        python -m venv venv
-        source venv/bin/activate
-    
-    - name: Install dependencies
-      run: |
-        source venv/bin/activate
-        pip install --upgrade pip
-        pip install -r requirements.txt
-    
-    - name: Collect static files
-      run: |
-        source venv/bin/activate
-        python manage.py collectstatic --noinput
-      env:
-        SECRET_KEY: ${{ secrets.SECRET_KEY }}
-        DEBUG: 'False'
-        ALLOWED_HOSTS: 'localhost'
-    
-    - name: Create deployment package
-      run: |
-        zip -r deployment.zip . -x "*.git*" "venv/*" "*.pyc" "__pycache__/*" "db.sqlite3"
-    
-    - name: Login to Azure
-      uses: azure/login@v1
-      with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
-    
-    - name: Configure Azure to install dependencies
-      run: |
-        az webapp config appsettings set \
-          --resource-group ${{ env.RESOURCE_GROUP }} \
-          --name ${{ env.AZURE_WEBAPP_NAME }} \
-          --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true
-    
-    - name: Deploy to Azure Web App
-      uses: azure/webapps-deploy@v2
-      with:
-        app-name: ${{ env.AZURE_WEBAPP_NAME }}
-        package: deployment.zip
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python version
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Create and start virtual environment
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+      
+      - name: Install dependencies
+        run: |
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Collect static files
+        run: |
+          source venv/bin/activate
+          python manage.py collectstatic --noinput
+        env:
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          DEBUG: 'False'
+          ALLOWED_HOSTS: 'localhost'
+      
+      - name: Zip artifact for deployment
+        run: zip release.zip ./* -r -x "*.git*" "venv/*" "*.pyc" "__pycache__/*" "db.sqlite3" ".env*"
+      
+      - name: Upload artifact for deployment jobs
+        uses: actions/upload-artifact@v3
+        with:
+          name: python-app
+          path: |
+            release.zip
+            !venv/
 
-    - name: Restart Web App
-      run: |
-        echo "Restarting web app to apply changes..."
-        az webapp restart \
-          --resource-group ${{ env.RESOURCE_GROUP }} \
-          --name ${{ env.AZURE_WEBAPP_NAME }}
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: 'Production'
+      url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
+    
+    steps:
+      - name: Download artifact from build job
+        uses: actions/download-artifact@v3
+        with:
+          name: python-app
+      
+      - name: Unzip artifact for deployment
+        run: unzip release.zip
+      
+      - name: 'Deploy to Azure Web App'
+        uses: azure/webapps-deploy@v2
+        id: deploy-to-webapp
+        with:
+          app-name: 'django-web-app-914b2d44'
+          slot-name: 'Production'
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
