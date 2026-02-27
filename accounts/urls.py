@@ -6,4 +6,5 @@ app_name = 'accounts'
 urlpatterns = [
     path('login/', views.login_view, name='login'),
     path('me/', views.me_view, name='me'),
+    path('refresh/', views.refresh_token, name='token-refresh'),
 ]

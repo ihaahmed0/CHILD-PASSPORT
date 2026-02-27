@@ -6,7 +6,9 @@ from django.contrib.auth import authenticate
 from core.responses import APIResponse
 from .serializers import LoginSerializer, UserSerializer
 from drf_spectacular.utils import extend_schema, OpenApiParameter
-
+from rest_framework_simplejwt.views import TokenRefreshView
+from rest_framework_simplejwt.serializers import TokenRefreshSerializer
+from drf_spectacular.utils import extend_schema
 
 @extend_schema(
     request=LoginSerializer,
@@ -84,3 +86,27 @@ def me_view(request):
         data=serializer.data,
         message="User info retrieved"
     )
+
+@extend_schema(
+    request=TokenRefreshSerializer,
+    responses={200: TokenRefreshSerializer},
+    description="Refresh access token using refresh token"
+)
+class CustomTokenRefreshView(TokenRefreshView):
+    def post(self, request, *args, **kwargs):
+        response = super().post(request, *args, **kwargs)
+        
+        if response.status_code == 200:
+            return APIResponse.success(
+                data={
+                    'access': response.data['access'],
+                    'refresh': response.data.get('refresh')  # If rotation enabled
+                },
+                message="Token refreshed successfully"
+            )
+        else:
+            return APIResponse.error(
+                errors=response.data,
+                message="Token refresh failed",
+                status_code=response.status_code
+            )

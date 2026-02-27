@@ -280,3 +280,36 @@ def upload_child_photo(request, code):
         data=serializer.data,
         message="Photo uploaded successfully"
     )
+
+
+
+@extend_schema(
+    responses={200: AssessmentSerializer},
+    parameters=[
+        OpenApiParameter('id', OpenApiTypes.INT, OpenApiParameter.PATH, description='Assessment ID'),
+    ],
+    description="Get single assessment by ID with results"
+)
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_assessment_detail(request, id):
+    """
+    Get Assessment Details by ID
+    
+    Returns complete assessment information including results
+    """
+    
+    assessment = get_object_or_404(Assessment, id=id)
+    
+    # Check permission - assessment's child must belong to user's school
+    if assessment.child.school != request.user.school:
+        return APIResponse.forbidden(
+            message="You don't have permission to view this assessment"
+        )
+    
+    serializer = AssessmentSerializer(assessment)
+    
+    return APIResponse.success(
+        data=serializer.data,
+        message="Assessment retrieved successfully"
+    )
