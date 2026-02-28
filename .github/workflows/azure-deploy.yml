@@ -49,33 +49,33 @@ jobs:
           DEBUG: 'False'
           ALLOWED_HOSTS: 'localhost'
       
-      # ============================================
+  # ============================================
       # STEP 5: CREATE DEPLOYMENT PACKAGE
       # ============================================
       - name: Create deployment package
         run: |
-          # Create a clean directory for deployment
-          mkdir -p deployment_package
+          # Create zip directly, excluding unnecessary files
+          zip -r deployment.zip . \
+            -x "*.git*" \
+            -x ".github/*" \
+            -x "venv/*" \
+            -x "env/*" \
+            -x ".venv/*" \
+            -x "*.pyc" \
+            -x "__pycache__/*" \
+            -x "*/__pycache__/*" \
+            -x "*/*/__pycache__/*" \
+            -x "db.sqlite3" \
+            -x ".env*" \
+            -x "*.md" \
+            -x ".gitignore" \
+            -x ".DS_Store" \
+            -x "*.log" \
+            -x "deployment_package/*"
           
-          # Copy all necessary files
-          cp -r . deployment_package/
+          echo "Deployment package created successfully"
+          ls -lh deployment.zip
           
-          # Remove unnecessary files from package
-          cd deployment_package
-          rm -rf .git .github venv env .venv
-          rm -rf __pycache__ */__pycache__ */*/__pycache__
-          rm -f .env .env.local db.sqlite3
-          rm -f *.md .gitignore .DS_Store
-          
-          # Create requirements.txt if not exists (backup)
-          if [ ! -f requirements.txt ]; then
-            pip freeze > requirements.txt
-          fi
-          
-          # Create the zip file
-          cd ..
-          zip -r deployment.zip deployment_package/*
-      
       # ============================================
       # STEP 6: LOGIN TO AZURE
       # ============================================
