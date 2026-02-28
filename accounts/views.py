@@ -6,9 +6,11 @@ from django.contrib.auth import authenticate
 from core.responses import APIResponse
 from .serializers import LoginSerializer, UserSerializer
 from drf_spectacular.utils import extend_schema, OpenApiParameter
-from rest_framework_simplejwt.views import TokenRefreshView
+
+from rest_framework.permissions import AllowAny
 from rest_framework_simplejwt.serializers import TokenRefreshSerializer
-from drf_spectacular.utils import extend_schema
+from rest_framework_simplejwt.exceptions import TokenError
+
 
 @extend_schema(
     request=LoginSerializer,
@@ -87,26 +89,49 @@ def me_view(request):
         message="User info retrieved"
     )
 
+
 @extend_schema(
     request=TokenRefreshSerializer,
-    responses={200: TokenRefreshSerializer},
+    responses={200: dict},
     description="Refresh access token using refresh token"
 )
-class CustomTokenRefreshView(TokenRefreshView):
-    def post(self, request, *args, **kwargs):
-        response = super().post(request, *args, **kwargs)
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def refresh_token(request):
+    """
+    Refresh Access Token
+    
+    Use the refresh token to get a new access token
+    """
+    refresh_token = request.data.get('refresh')
+    
+    if not refresh_token:
+        return APIResponse.validation_error(
+            errors={'refresh': 'Refresh token is required'},
+            message="Validation failed"
+        )
+    
+    serializer = TokenRefreshSerializer(data={'refresh': refresh_token})
+    
+    try:
+        serializer.is_valid(raise_exception=True)
         
-        if response.status_code == 200:
-            return APIResponse.success(
-                data={
-                    'access': response.data['access'],
-                    'refresh': response.data.get('refresh')  # If rotation enabled
-                },
-                message="Token refreshed successfully"
-            )
-        else:
-            return APIResponse.error(
-                errors=response.data,
-                message="Token refresh failed",
-                status_code=response.status_code
-            )
+        return APIResponse.success(
+            data={
+                'access': serializer.validated_data['access'],
+                'refresh': serializer.validated_data.get('refresh')  # In case rotation is enabled
+            },
+            message="Token refreshed successfully"
+        )
+    except TokenError as e:
+        return APIResponse.error(
+            errors={'refresh': 'Invalid or expired refresh token'},
+            message="Token refresh failed",
+            status_code=status.HTTP_401_UNAUTHORIZED
+        )
+    except Exception as e:
+        return APIResponse.error(
+            errors={'detail': str(e)},
+            message="Token refresh failed",
+            status_code=status.HTTP_400_BAD_REQUEST
+        )
