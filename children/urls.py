@@ -4,15 +4,19 @@ from . import views
 app_name = 'children'
 
 urlpatterns = [
-     # Children CRUD
+    # Children list and add
     path('', views.children_list, name='children-list'),
     path('add/', views.add_child, name='add-child'),
-    path('/', views.child_detail, name='child-detail'),
-    path('/assessments/', views.child_assessments, name='child-assessments'),
-    path('/upload-photo/', views.upload_child_photo, name='upload-child-photo'),
     
-    # Assessments
-    path('assessments//', views.get_assessment_detail, name='get-assessment'),  # NEW
-    path('assessments//update/', views.update_assessment, name='update-assessment'),
+    # Assessment categories (no child code needed)
     path('assessments/categories/', views.assessment_categories, name='assessment-categories'),
+    
+    # Single assessment by ID (no child code needed)
+    path('assessments/<int:id>/', views.get_assessment_detail, name='get-assessment-detail'),
+    path('assessments/<int:id>/update/', views.update_assessment, name='update-assessment'),
+    
+    # Child-specific endpoints (child code required)
+    path('<str:code>/', views.child_detail, name='child-detail'),
+    path('<str:code>/assessments/', views.child_assessments, name='child-assessments'),
+    path('<str:code>/upload-photo/', views.upload_child_photo, name='upload-child-photo'),
 ]
