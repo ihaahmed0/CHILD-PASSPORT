@@ -204,17 +204,19 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 USE_AZURE_STORAGE = os.getenv('USE_AZURE_STORAGE', 'False') == 'True'
 
 if USE_AZURE_STORAGE:
-    # Use Azure Blob Storage for media files
     AZURE_ACCOUNT_NAME = os.getenv('AZURE_ACCOUNT_NAME')
     AZURE_ACCOUNT_KEY = os.getenv('AZURE_ACCOUNT_KEY')
     AZURE_CONTAINER = os.getenv('AZURE_CONTAINER_NAME', os.getenv('AZURE_CONTAINER', 'media'))
-    
-    # Configure storage backend
+    AZURE_OVERWRITE_FILES = True       # Re-uploading the same filename replaces the blob
+    AZURE_URL_EXPIRY_SECS = None       # No SAS tokens — container must have Blob public access
+
     DEFAULT_FILE_STORAGE = 'storages.backends.azure_storage.AzureStorage'
-    AZURE_CUSTOM_DOMAIN = f'{AZURE_ACCOUNT_NAME}.blob.core.windows.net'
-    MEDIA_URL = f'https://{AZURE_CUSTOM_DOMAIN}/{AZURE_CONTAINER}/'
+
+    # Used by Django admin for display only.
+    # DO NOT set AZURE_CUSTOM_DOMAIN — django-storages omits the container
+    # name from URLs when it is set, causing every image URL to 404.
+    MEDIA_URL = f'https://{AZURE_ACCOUNT_NAME}.blob.core.windows.net/{AZURE_CONTAINER}/'
 else:
-    # Use local file storage (development)
     MEDIA_URL = '/media/'
     MEDIA_ROOT = BASE_DIR / 'media'
     os.makedirs(MEDIA_ROOT, exist_ok=True)

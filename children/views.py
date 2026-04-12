@@ -57,8 +57,8 @@ def children_list(request):
     children = queryset[start:end]
     total_count = queryset.count()
     
-    serializer = ChildListSerializer(children, many=True)
-    
+    serializer = ChildListSerializer(children, many=True, context={'request': request})
+
     return APIResponse.success(
         data={
             'children': serializer.data,
@@ -111,8 +111,8 @@ def add_child(request):
             created_by=request.user
         )
     
-    detail_serializer = ChildDetailSerializer(child)
-    
+    detail_serializer = ChildDetailSerializer(child, context={'request': request})
+
     return APIResponse.created(
         data=detail_serializer.data,
         message="Child added successfully"
@@ -139,8 +139,8 @@ def child_detail(request, code):
             message="You don't have permission to view this child"
         )
     
-    serializer = ChildDetailSerializer(child)
-    
+    serializer = ChildDetailSerializer(child, context={'request': request})
+
     return APIResponse.success(
         data=serializer.data,
         message="Child details retrieved"
@@ -172,7 +172,7 @@ def child_assessments(request, code):
     
     return APIResponse.success(
         data={
-            'child': ChildDetailSerializer(child).data,
+            'child': ChildDetailSerializer(child, context={'request': request}).data,
             'assessments': serializer.data
         },
         message="Assessments retrieved"
@@ -201,9 +201,10 @@ def update_assessment(request, id):
         )
     
     serializer = AssessmentSerializer(
-        assessment, 
-        data=request.data, 
-        partial=True
+        assessment,
+        data=request.data,
+        partial=True,
+        context={'request': request}
     )
     
     if not serializer.is_valid():
@@ -272,10 +273,10 @@ def upload_child_photo(request, code):
         )
     
     child.photo = request.FILES['photo']
-    child.save()
-    
-    serializer = ChildDetailSerializer(child)
-    
+    child.save(update_fields=['photo'])
+
+    serializer = ChildDetailSerializer(child, context={'request': request})
+
     return APIResponse.success(
         data=serializer.data,
         message="Photo uploaded successfully"
@@ -307,8 +308,8 @@ def get_assessment_detail(request, id):
             message="You don't have permission to view this assessment"
         )
     
-    serializer = AssessmentSerializer(assessment)
-    
+    serializer = AssessmentSerializer(assessment, context={'request': request})
+
     return APIResponse.success(
         data=serializer.data,
         message="Assessment retrieved successfully"

@@ -108,36 +108,32 @@ jobs:
             --linux-fx-version "PYTHON|${{ env.PYTHON_VERSION }}" \
             --startup-file "gunicorn childpassport.wsgi --bind=0.0.0.0:8000 --workers=2 --timeout=120 --access-logfile=- --error-logfile=- --log-level=info"
 
-      # ── Fetch Kudu credentials ───────────────────────
-      # Needed for both deployment and migrations.
-      - name: Fetch Kudu credentials
-        id: kudu
+      # ── Get Azure AD Bearer token for Kudu ──────────
+      # Basic Auth (publishing credentials) is disabled by
+      # default on Azure App Service since 2023. Bearer token
+      # from the already-authenticated service principal works
+      # without any extra Azure configuration.
+      - name: Get Kudu Bearer token
         run: |
-          USER=$(az webapp deployment list-publishing-credentials \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --name "${{ env.AZURE_WEBAPP_NAME }}" \
-            --query "publishingUserName" -o tsv)
-          PASS=$(az webapp deployment list-publishing-credentials \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --name "${{ env.AZURE_WEBAPP_NAME }}" \
-            --query "publishingPassword" -o tsv)
-          echo "kudu_user=$USER" >> $GITHUB_OUTPUT
-          echo "kudu_pass=$PASS" >> $GITHUB_OUTPUT
+          TOKEN=$(az account get-access-token \
+            --resource "https://management.azure.com" \
+            --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "KUDU_TOKEN=$TOKEN" >> $GITHUB_ENV
 
       # ── Deploy via Kudu REST API ─────────────────────
-      # Uses isAsync=true so we POST the zip and get back
-      # immediately (HTTP 202). We then poll the deployment
-      # status ourselves — no more "stuck at starting site".
+      # Uses isAsync=true: POST the zip → HTTP 202 immediately.
+      # We then poll deployment status ourselves — no more
+      # "stuck at starting site" from the Azure CLI.
       #
-      # Kudu deployment status codes:
-      #   0 = Pending  1 = Building  2 = Deploying
-      #   3 = Failed   4 = Success
+      # Kudu status codes: 0=Pending 1=Building 2=Deploying
+      #                    3=Failed  4=Success
       - name: Deploy zip (async)
         run: |
           echo "Uploading zip to Kudu..."
           HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
             "https://${{ env.AZURE_WEBAPP_NAME }}.scm.azurewebsites.net/api/zipdeploy?isAsync=true" \
-            -u "${{ steps.kudu.outputs.kudu_user }}:${{ steps.kudu.outputs.kudu_pass }}" \
+            -H "Authorization: Bearer $KUDU_TOKEN" \
             -H "Content-Type: application/zip" \
             --data-binary @deployment.zip \
             --max-time 120)
@@ -155,9 +151,8 @@ jobs:
           i=0
 
           while [ $i -lt $MAX ]; do
-            RESPONSE=$(curl -s \
-              -u "${{ steps.kudu.outputs.kudu_user }}:${{ steps.kudu.outputs.kudu_pass }}" \
-              "$KUDU")
+            RESPONSE=$(curl -s "$KUDU" \
+              -H "Authorization: Bearer $KUDU_TOKEN")
 
             STATUS=$(echo "$RESPONSE" | jq -r '.status // 0')
             MSG=$(echo "$RESPONSE"    | jq -r '.status_text // "..."')
@@ -185,15 +180,15 @@ jobs:
           fi
 
       # ── Run migrations via Kudu command API ─────────
-      # Runs directly inside the container — no HTTP,
-      # no gunicorn. antenv is guaranteed to exist here
-      # because Oryx just finished building it above.
+      # Runs directly inside the container — independent of
+      # gunicorn. antenv is guaranteed to exist because Oryx
+      # just finished building it in the step above.
       - name: Run database migrations
         run: |
           echo "Running migrations..."
           RESPONSE=$(curl -s -X POST \
             "https://${{ env.AZURE_WEBAPP_NAME }}.scm.azurewebsites.net/api/command" \
-            -u "${{ steps.kudu.outputs.kudu_user }}:${{ steps.kudu.outputs.kudu_pass }}" \
+            -H "Authorization: Bearer $KUDU_TOKEN" \
             -H "Content-Type: application/json" \
             -d '{
               "command": "source antenv/bin/activate && python manage.py migrate --noinput && (python manage.py seed_assessment_categories 2>/dev/null || true)",
