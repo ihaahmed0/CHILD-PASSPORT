@@ -91,9 +91,7 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # ── Configure App Service ────────────────────────
-      # - Oryx builds on deploy (installs requirements.txt → antenv)
-      # - Startup command is gunicorn directly — no startup script needed
+      # ── Configure App Service (idempotent) ───────────
       - name: Configure Azure App Service
         run: |
           az webapp config appsettings set \
@@ -108,47 +106,101 @@ jobs:
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --name "${{ env.AZURE_WEBAPP_NAME }}" \
             --linux-fx-version "PYTHON|${{ env.PYTHON_VERSION }}" \
-            --startup-file "gunicorn childpassport.wsgi --bind=0.0.0.0:8000 --workers=2 --timeout=120 --preload --access-logfile=- --error-logfile=- --log-level=info"
+            --startup-file "gunicorn childpassport.wsgi --bind=0.0.0.0:8000 --workers=2 --timeout=120 --access-logfile=- --error-logfile=- --log-level=info"
 
-      # ── Deploy ───────────────────────────────────────
-      # config-zip is synchronous: it waits for Oryx to finish
-      # building (pip install → antenv) before returning.
-      # The app then restarts automatically.
-      - name: Deploy to Azure
+      # ── Fetch Kudu credentials ───────────────────────
+      # Needed for both deployment and migrations.
+      - name: Fetch Kudu credentials
+        id: kudu
         run: |
-          az webapp deployment source config-zip \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --name "${{ env.AZURE_WEBAPP_NAME }}" \
-            --src deployment.zip \
-            --timeout 600
-
-      # ── Run migrations via Kudu API ──────────────────
-      # Kudu runs commands directly inside the app container,
-      # independently of gunicorn — no HTTP involved.
-      # This runs AFTER Oryx has built antenv, so all packages exist.
-      - name: Run database migrations
-        run: |
-          echo "Fetching Kudu credentials..."
-          KUDU_USER=$(az webapp deployment list-publishing-credentials \
+          USER=$(az webapp deployment list-publishing-credentials \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --name "${{ env.AZURE_WEBAPP_NAME }}" \
             --query "publishingUserName" -o tsv)
-          KUDU_PASS=$(az webapp deployment list-publishing-credentials \
+          PASS=$(az webapp deployment list-publishing-credentials \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --name "${{ env.AZURE_WEBAPP_NAME }}" \
             --query "publishingPassword" -o tsv)
+          echo "kudu_user=$USER" >> $GITHUB_OUTPUT
+          echo "kudu_pass=$PASS" >> $GITHUB_OUTPUT
 
+      # ── Deploy via Kudu REST API ─────────────────────
+      # Uses isAsync=true so we POST the zip and get back
+      # immediately (HTTP 202). We then poll the deployment
+      # status ourselves — no more "stuck at starting site".
+      #
+      # Kudu deployment status codes:
+      #   0 = Pending  1 = Building  2 = Deploying
+      #   3 = Failed   4 = Success
+      - name: Deploy zip (async)
+        run: |
+          echo "Uploading zip to Kudu..."
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            "https://${{ env.AZURE_WEBAPP_NAME }}.scm.azurewebsites.net/api/zipdeploy?isAsync=true" \
+            -u "${{ steps.kudu.outputs.kudu_user }}:${{ steps.kudu.outputs.kudu_pass }}" \
+            -H "Content-Type: application/zip" \
+            --data-binary @deployment.zip \
+            --max-time 120)
+
+          if [ "$HTTP" != "202" ]; then
+            echo "Upload failed — HTTP $HTTP"
+            exit 1
+          fi
+          echo "Upload accepted (HTTP 202). Oryx is building..."
+
+      - name: Wait for Oryx build to complete
+        run: |
+          KUDU="https://${{ env.AZURE_WEBAPP_NAME }}.scm.azurewebsites.net/api/deployments/latest"
+          MAX=60   # 60 × 10 s = 10 min
+          i=0
+
+          while [ $i -lt $MAX ]; do
+            RESPONSE=$(curl -s \
+              -u "${{ steps.kudu.outputs.kudu_user }}:${{ steps.kudu.outputs.kudu_pass }}" \
+              "$KUDU")
+
+            STATUS=$(echo "$RESPONSE" | jq -r '.status // 0')
+            MSG=$(echo "$RESPONSE"    | jq -r '.status_text // "..."')
+
+            echo "  [$(( i * 10 ))s] status=$STATUS  $MSG"
+
+            if [ "$STATUS" = "4" ]; then
+              echo "Build and deployment complete."
+              break
+            fi
+
+            if [ "$STATUS" = "3" ]; then
+              echo "Deployment failed."
+              echo "$RESPONSE" | jq -r '.log_url // ""'
+              exit 1
+            fi
+
+            i=$(( i + 1 ))
+            sleep 10
+          done
+
+          if [ $i -ge $MAX ]; then
+            echo "Deployment timed out after 10 minutes."
+            exit 1
+          fi
+
+      # ── Run migrations via Kudu command API ─────────
+      # Runs directly inside the container — no HTTP,
+      # no gunicorn. antenv is guaranteed to exist here
+      # because Oryx just finished building it above.
+      - name: Run database migrations
+        run: |
           echo "Running migrations..."
           RESPONSE=$(curl -s -X POST \
             "https://${{ env.AZURE_WEBAPP_NAME }}.scm.azurewebsites.net/api/command" \
-            -u "${KUDU_USER}:${KUDU_PASS}" \
+            -u "${{ steps.kudu.outputs.kudu_user }}:${{ steps.kudu.outputs.kudu_pass }}" \
             -H "Content-Type: application/json" \
             -d '{
               "command": "source antenv/bin/activate && python manage.py migrate --noinput && (python manage.py seed_assessment_categories 2>/dev/null || true)",
               "dir": "/home/site/wwwroot"
             }')
 
-          echo "--- Migration output ---"
+          echo "--- Output ---"
           echo "$RESPONSE" | jq -r '.Output // "no output"'
 
           ERRORS=$(echo "$RESPONSE" | jq -r '.Error // ""')
@@ -156,30 +208,32 @@ jobs:
 
           EXIT_CODE=$(echo "$RESPONSE" | jq -r '.ExitCode // 1')
           if [ "$EXIT_CODE" != "0" ]; then
-            echo "Migrations failed (exit code $EXIT_CODE). Aborting deployment."
+            echo "Migrations failed (exit code $EXIT_CODE)."
             exit 1
           fi
           echo "Migrations completed successfully."
 
       # ── Health check ─────────────────────────────────
-      # Polls every 10 s for up to 3 minutes.
-      # On failure, tails the live app logs automatically.
       - name: Health check
         run: |
           URL="https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/docs/"
-          MAX=18
+          MAX=18   # 18 × 10 s = 3 min
           i=0
           echo "Polling $URL ..."
+
           while [ $i -lt $MAX ]; do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$URL" || echo "000")
             echo "  [$(( i * 10 ))s] HTTP $STATUS"
+
             if [ "$STATUS" = "200" ] || [ "$STATUS" = "302" ]; then
               echo "App is healthy."
               exit 0
             fi
+
             i=$(( i + 1 ))
             sleep 10
           done
+
           echo "App did not respond within 3 minutes — fetching logs..."
           az webapp log tail \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
