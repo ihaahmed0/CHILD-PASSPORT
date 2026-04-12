@@ -1,27 +1,39 @@
+#!/bin/bash
 set -e
 
-echo "=== Custom Startup Script ==="
+echo "=========================================="
+echo " App Startup — $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "=========================================="
 
-# Navigate to app directory
 cd /home/site/wwwroot
 
-# Install dependencies if not already installed
-if [ ! -d "/home/site/wwwroot/antenv" ]; then
-    echo "Installing dependencies..."
-    python -m pip install --upgrade pip
-    python -m pip install -r requirements.txt
+# Activate the virtual environment created by Oryx during deployment.
+# This must exist — if it doesn't, the deployment itself failed.
+if [ -f "antenv/bin/activate" ]; then
+    echo "[startup] Activating antenv..."
+    source antenv/bin/activate
 else
-    echo "Dependencies already installed"
+    echo "[startup] ERROR: antenv not found. Was Oryx build enabled during deployment?"
+    exit 1
 fi
 
-# Run migrations
-echo "Running migrations..."
-python manage.py migrate --noinput || echo "Migrations failed or already applied"
+echo "[startup] Python: $(python --version)"
+echo "[startup] Gunicorn: $(gunicorn --version)"
 
-# Seed categories
-echo "Seeding assessment categories..."
-python manage.py seed_assessment_categories || echo "Categories already seeded"
+# Run database migrations (idempotent — safe to run on every boot)
+echo "[startup] Running database migrations..."
+python manage.py migrate --noinput
 
-# Start Gunicorn
-echo "Starting Gunicorn..."
-gunicorn --bind=0.0.0.0 --timeout 600 childpassport.wsgi
+# Seed static/reference data
+echo "[startup] Seeding assessment categories..."
+python manage.py seed_assessment_categories 2>/dev/null || echo "[startup] Already seeded, skipping."
+
+echo "[startup] Starting Gunicorn on port 8000..."
+exec gunicorn childpassport.wsgi \
+    --bind=0.0.0.0:8000 \
+    --workers=2 \
+    --timeout=120 \
+    --preload \
+    --access-logfile='-' \
+    --error-logfile='-' \
+    --log-level=info

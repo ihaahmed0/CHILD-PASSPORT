@@ -12,37 +12,36 @@ env:
   AZURE_WEBAPP_NAME: 'django-web-app-914b2d44'
   RESOURCE_GROUP: 'django-app-rg'
 
+# Prevent concurrent deployments — queue them instead of running in parallel
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+# ══════════════════════════════════════════════════════
+# JOB 1 — BUILD
+# Installs deps, collects static files, produces a zip.
+# Completely isolated from Azure — can be re-run cheaply.
+# ══════════════════════════════════════════════════════
 jobs:
-  build-and-deploy:
+  build:
+    name: Build
     runs-on: ubuntu-latest
 
     steps:
-      # ============================================
-      # STEP 1: CHECKOUT CODE
-      # ============================================
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ============================================
-      # STEP 2: SET UP PYTHON WITH CACHING
-      # ============================================
       - name: Set up Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
+          cache: pip
 
-      # ============================================
-      # STEP 3: INSTALL DEPENDENCIES
-      # ============================================
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ============================================
-      # STEP 4: COLLECT STATIC FILES
-      # ============================================
       - name: Collect static files
         run: python manage.py collectstatic --noinput
         env:
@@ -50,131 +49,137 @@ jobs:
           DEBUG: 'False'
           ALLOWED_HOSTS: 'localhost'
 
-      # ============================================
-      # STEP 5: CREATE DEPLOYMENT PACKAGE
-      # ============================================
-      - name: Create deployment package
+      - name: Create deployment zip
         run: |
           zip -r deployment.zip . \
             -x "*.git*" \
             -x ".github/*" \
-            -x "venv/*" \
-            -x "env/*" \
-            -x ".venv/*" \
+            -x "venv/*" "env/*" ".venv/*" \
             -x "*.pyc" \
-            -x "__pycache__/*" \
-            -x "*/__pycache__/*" \
-            -x "*/*/__pycache__/*" \
+            -x "__pycache__/*" "*/__pycache__/*" "*/*/__pycache__/*" \
             -x "db.sqlite3" \
-            -x ".env*" \
-            -x "*.md" \
-            -x ".gitignore" \
-            -x ".DS_Store" \
-            -x "*.log"
-          echo "Deployment package size: $(du -sh deployment.zip | cut -f1)"
+            -x ".env" ".env.*" \
+            -x "*.md" ".gitignore" ".DS_Store" \
+            -x "*.log" \
+            -x "deploy*.zip" "manual-deploy.zip" "publish-profile.xml"
+          echo "Package size: $(du -sh deployment.zip | cut -f1)"
 
-      # ============================================
-      # STEP 6: LOGIN TO AZURE
-      # ============================================
+      # Pass the zip to the deploy job without re-checking out
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-package
+          path: deployment.zip
+          retention-days: 1
+
+  # ══════════════════════════════════════════════════════
+  # JOB 2 — DEPLOY
+  # Downloads the artifact, configures Azure once,
+  # deploys, then polls until the app is healthy.
+  # ══════════════════════════════════════════════════════
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: production
+      url: https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net
+
+    steps:
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-package
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # ============================================
-      # STEP 7: CONFIGURE AZURE APP SETTINGS
-      # Only runs once unless config changes — idempotent
-      # ============================================
-      - name: Configure Azure App Settings
+      # ── Configure Azure ─────────────────────────────
+      # Idempotent — safe to run every deploy.
+      # Key decisions:
+      #   SCM_DO_BUILD_DURING_DEPLOYMENT=true  → Oryx installs requirements.txt
+      #     on Azure during deployment (sync), so startup.sh never needs pip install.
+      #   WEBSITE_RUN_FROM_PACKAGE=0           → files are extracted to wwwroot (needed
+      #     for startup.sh to write logs / run migrations).
+      #   startup-file → our script that activates antenv, migrates, starts gunicorn.
+      - name: Configure Azure App Service
         run: |
-          # Disable Oryx rebuild (we ship a complete package from CI)
           az webapp config appsettings set \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.AZURE_WEBAPP_NAME }} \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --name "${{ env.AZURE_WEBAPP_NAME }}" \
             --settings \
-              SCM_DO_BUILD_DURING_DEPLOYMENT=false \
-              ENABLE_ORYX_BUILD=false \
-              WEBSITE_RUN_FROM_PACKAGE=0
+              SCM_DO_BUILD_DURING_DEPLOYMENT=true \
+              ENABLE_ORYX_BUILD=true \
+              WEBSITE_RUN_FROM_PACKAGE=0 \
+              PRE_BUILD_COMMAND="" \
+              POST_BUILD_COMMAND=""
 
-          # Set Python runtime
           az webapp config set \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.AZURE_WEBAPP_NAME }} \
-            --linux-fx-version "PYTHON|${{ env.PYTHON_VERSION }}"
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --name "${{ env.AZURE_WEBAPP_NAME }}" \
+            --linux-fx-version "PYTHON|${{ env.PYTHON_VERSION }}" \
+            --startup-file "bash /home/site/wwwroot/startup.sh"
 
-          # Point startup to startup.sh so migrations run on every boot
-          az webapp config set \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.AZURE_WEBAPP_NAME }} \
-            --startup-file "/home/site/wwwroot/startup.sh"
-
-      # ============================================
-      # STEP 8: DEPLOY TO AZURE
-      # ============================================
-      - name: Deploy to Azure Web App
+      # ── Deploy ──────────────────────────────────────
+      # config-zip with Oryx enabled is SYNCHRONOUS:
+      #   upload → extract → Oryx pip install → app restart
+      # The command only returns after Oryx finishes building.
+      # No separate restart step needed — Oryx triggers it.
+      - name: Deploy zip to Azure
         run: |
+          echo "Uploading and building on Azure (this includes pip install)..."
           az webapp deployment source config-zip \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.AZURE_WEBAPP_NAME }} \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --name "${{ env.AZURE_WEBAPP_NAME }}" \
             --src deployment.zip \
             --timeout 600
+          echo "Deployment and Oryx build complete. App is restarting via startup.sh."
 
-      # ============================================
-      # STEP 9: RESTART TO APPLY CHANGES & RUN MIGRATIONS
-      # startup.sh runs migrate + seed on every restart
-      # ============================================
-      - name: Restart Azure Web App
+      # ── Health check ────────────────────────────────
+      # Polls /api/docs/ every 10 s for up to 3 minutes.
+      # startup.sh runs migrate (~5–15 s) then gunicorn — so the app
+      # should be responsive well within that window.
+      - name: Wait for app to be healthy
         run: |
-          az webapp restart \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.AZURE_WEBAPP_NAME }}
-
-      # ============================================
-      # STEP 10: WAIT FOR APP TO BE READY (HEALTH CHECK)
-      # ============================================
-      - name: Wait for app to be ready
-        run: |
-          echo "Waiting for app to respond..."
-          MAX_ATTEMPTS=20
-          ATTEMPT=0
           URL="https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/docs/"
+          MAX=18   # 18 × 10 s = 3 minutes
+          i=0
+          echo "Polling $URL ..."
 
-          until [ $ATTEMPT -ge $MAX_ATTEMPTS ]; do
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
-            echo "Attempt $((ATTEMPT+1))/$MAX_ATTEMPTS — HTTP $HTTP_STATUS"
+          while [ $i -lt $MAX ]; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$URL" || echo "000")
+            echo "  [$(( i * 10 ))s] HTTP $STATUS"
 
-            if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "302" ]; then
-              echo "App is ready."
-              break
+            if [ "$STATUS" = "200" ] || [ "$STATUS" = "302" ]; then
+              echo "App is healthy."
+              exit 0
             fi
 
-            ATTEMPT=$((ATTEMPT+1))
+            i=$(( i + 1 ))
             sleep 10
           done
 
-          if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
-            echo "App did not become ready in time. Check Azure logs."
-            exit 1
-          fi
+          echo "App did not become healthy within 3 minutes."
+          echo "Fetching recent logs..."
+          az webapp log tail \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --name "${{ env.AZURE_WEBAPP_NAME }}" \
+            --timeout 15 || true
+          exit 1
 
-      # ============================================
-      # STEP 11: CLEANUP
-      # ============================================
-      - name: Cleanup
-        if: always()
-        run: rm -f deployment.zip
-
-      # ============================================
-      # STEP 12: DEPLOYMENT SUMMARY
-      # ============================================
+      # ── Summary ─────────────────────────────────────
       - name: Deployment summary
         if: always()
         run: |
           echo "================================================"
-          echo "Application : ${{ env.AZURE_WEBAPP_NAME }}"
-          echo "Resource    : ${{ env.RESOURCE_GROUP }}"
-          echo "Python      : ${{ env.PYTHON_VERSION }}"
-          echo "URL         : https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net"
-          echo "API Docs    : https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/docs/"
-          echo "Admin       : https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/admin/"
+          echo "App     : ${{ env.AZURE_WEBAPP_NAME }}"
+          echo "URL     : https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net"
+          echo "API     : https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/docs/"
+          echo "Admin   : https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/admin/"
           echo "================================================"
+
+      - name: Cleanup artifact
+        if: always()
+        run: rm -f deployment.zip
