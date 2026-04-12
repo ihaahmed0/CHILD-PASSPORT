@@ -12,15 +12,13 @@ env:
   AZURE_WEBAPP_NAME: 'django-web-app-914b2d44'
   RESOURCE_GROUP: 'django-app-rg'
 
-# Prevent concurrent deployments — queue them instead of running in parallel
+# Prevent two deploys racing each other
 concurrency:
   group: production-deploy
   cancel-in-progress: false
 
 # ══════════════════════════════════════════════════════
 # JOB 1 — BUILD
-# Installs deps, collects static files, produces a zip.
-# Completely isolated from Azure — can be re-run cheaply.
 # ══════════════════════════════════════════════════════
 jobs:
   build:
@@ -64,7 +62,6 @@ jobs:
             -x "deploy*.zip" "manual-deploy.zip" "publish-profile.xml"
           echo "Package size: $(du -sh deployment.zip | cut -f1)"
 
-      # Pass the zip to the deploy job without re-checking out
       - name: Upload deployment artifact
         uses: actions/upload-artifact@v4
         with:
@@ -74,8 +71,6 @@ jobs:
 
   # ══════════════════════════════════════════════════════
   # JOB 2 — DEPLOY
-  # Downloads the artifact, configures Azure once,
-  # deploys, then polls until the app is healthy.
   # ══════════════════════════════════════════════════════
   deploy:
     name: Deploy
@@ -96,14 +91,9 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # ── Configure Azure ─────────────────────────────
-      # Idempotent — safe to run every deploy.
-      # Key decisions:
-      #   SCM_DO_BUILD_DURING_DEPLOYMENT=true  → Oryx installs requirements.txt
-      #     on Azure during deployment (sync), so startup.sh never needs pip install.
-      #   WEBSITE_RUN_FROM_PACKAGE=0           → files are extracted to wwwroot (needed
-      #     for startup.sh to write logs / run migrations).
-      #   startup-file → our script that activates antenv, migrates, starts gunicorn.
+      # ── Configure App Service ────────────────────────
+      # - Oryx builds on deploy (installs requirements.txt → antenv)
+      # - Startup command is gunicorn directly — no startup script needed
       - name: Configure Azure App Service
         run: |
           az webapp config appsettings set \
@@ -112,74 +102,101 @@ jobs:
             --settings \
               SCM_DO_BUILD_DURING_DEPLOYMENT=true \
               ENABLE_ORYX_BUILD=true \
-              WEBSITE_RUN_FROM_PACKAGE=0 \
-              PRE_BUILD_COMMAND="" \
-              POST_BUILD_COMMAND=""
+              WEBSITE_RUN_FROM_PACKAGE=0
 
           az webapp config set \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --name "${{ env.AZURE_WEBAPP_NAME }}" \
             --linux-fx-version "PYTHON|${{ env.PYTHON_VERSION }}" \
-            --startup-file "bash /home/site/wwwroot/startup.sh"
+            --startup-file "gunicorn childpassport.wsgi --bind=0.0.0.0:8000 --workers=2 --timeout=120 --preload --access-logfile=- --error-logfile=- --log-level=info"
 
-      # ── Deploy ──────────────────────────────────────
-      # config-zip with Oryx enabled is SYNCHRONOUS:
-      #   upload → extract → Oryx pip install → app restart
-      # The command only returns after Oryx finishes building.
-      # No separate restart step needed — Oryx triggers it.
-      - name: Deploy zip to Azure
+      # ── Deploy ───────────────────────────────────────
+      # config-zip is synchronous: it waits for Oryx to finish
+      # building (pip install → antenv) before returning.
+      # The app then restarts automatically.
+      - name: Deploy to Azure
         run: |
-          echo "Uploading and building on Azure (this includes pip install)..."
           az webapp deployment source config-zip \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --name "${{ env.AZURE_WEBAPP_NAME }}" \
             --src deployment.zip \
             --timeout 600
-          echo "Deployment and Oryx build complete. App is restarting via startup.sh."
 
-      # ── Health check ────────────────────────────────
-      # Polls /api/docs/ every 10 s for up to 3 minutes.
-      # startup.sh runs migrate (~5–15 s) then gunicorn — so the app
-      # should be responsive well within that window.
-      - name: Wait for app to be healthy
+      # ── Run migrations via Kudu API ──────────────────
+      # Kudu runs commands directly inside the app container,
+      # independently of gunicorn — no HTTP involved.
+      # This runs AFTER Oryx has built antenv, so all packages exist.
+      - name: Run database migrations
+        run: |
+          echo "Fetching Kudu credentials..."
+          KUDU_USER=$(az webapp deployment list-publishing-credentials \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --name "${{ env.AZURE_WEBAPP_NAME }}" \
+            --query "publishingUserName" -o tsv)
+          KUDU_PASS=$(az webapp deployment list-publishing-credentials \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --name "${{ env.AZURE_WEBAPP_NAME }}" \
+            --query "publishingPassword" -o tsv)
+
+          echo "Running migrations..."
+          RESPONSE=$(curl -s -X POST \
+            "https://${{ env.AZURE_WEBAPP_NAME }}.scm.azurewebsites.net/api/command" \
+            -u "${KUDU_USER}:${KUDU_PASS}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "command": "source antenv/bin/activate && python manage.py migrate --noinput && (python manage.py seed_assessment_categories 2>/dev/null || true)",
+              "dir": "/home/site/wwwroot"
+            }')
+
+          echo "--- Migration output ---"
+          echo "$RESPONSE" | jq -r '.Output // "no output"'
+
+          ERRORS=$(echo "$RESPONSE" | jq -r '.Error // ""')
+          [ -n "$ERRORS" ] && echo "--- Errors ---" && echo "$ERRORS"
+
+          EXIT_CODE=$(echo "$RESPONSE" | jq -r '.ExitCode // 1')
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "Migrations failed (exit code $EXIT_CODE). Aborting deployment."
+            exit 1
+          fi
+          echo "Migrations completed successfully."
+
+      # ── Health check ─────────────────────────────────
+      # Polls every 10 s for up to 3 minutes.
+      # On failure, tails the live app logs automatically.
+      - name: Health check
         run: |
           URL="https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/docs/"
-          MAX=18   # 18 × 10 s = 3 minutes
+          MAX=18
           i=0
           echo "Polling $URL ..."
-
           while [ $i -lt $MAX ]; do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$URL" || echo "000")
             echo "  [$(( i * 10 ))s] HTTP $STATUS"
-
             if [ "$STATUS" = "200" ] || [ "$STATUS" = "302" ]; then
               echo "App is healthy."
               exit 0
             fi
-
             i=$(( i + 1 ))
             sleep 10
           done
-
-          echo "App did not become healthy within 3 minutes."
-          echo "Fetching recent logs..."
+          echo "App did not respond within 3 minutes — fetching logs..."
           az webapp log tail \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --name "${{ env.AZURE_WEBAPP_NAME }}" \
             --timeout 15 || true
           exit 1
 
-      # ── Summary ─────────────────────────────────────
+      - name: Cleanup
+        if: always()
+        run: rm -f deployment.zip
+
       - name: Deployment summary
         if: always()
         run: |
           echo "================================================"
-          echo "App     : ${{ env.AZURE_WEBAPP_NAME }}"
-          echo "URL     : https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net"
-          echo "API     : https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/docs/"
-          echo "Admin   : https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/admin/"
+          echo "App   : ${{ env.AZURE_WEBAPP_NAME }}"
+          echo "URL   : https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net"
+          echo "Docs  : https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/docs/"
+          echo "Admin : https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/admin/"
           echo "================================================"
-
-      - name: Cleanup artifact
-        if: always()
-        run: rm -f deployment.zip
