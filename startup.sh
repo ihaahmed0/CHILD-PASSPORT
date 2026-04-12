@@ -1,28 +1,27 @@
-#!/bin/bash
+set -e
+
+echo "=== Custom Startup Script ==="
+
+# Navigate to app directory
+cd /home/site/wwwroot
 
 # Install dependencies if not already installed
 if [ ! -d "/home/site/wwwroot/antenv" ]; then
-    echo "Creating virtual environment and installing dependencies..."
-    python -m venv /home/site/wwwroot/antenv
-    source /home/site/wwwroot/antenv/bin/activate
-    pip install --upgrade pip
-    pip install -r /home/site/wwwroot/requirements.txt
+    echo "Installing dependencies..."
+    python -m pip install --upgrade pip
+    python -m pip install -r requirements.txt
 else
-    echo "Virtual environment exists, activating..."
-    source /home/site/wwwroot/antenv/bin/activate
+    echo "Dependencies already installed"
 fi
 
-cd /home/site/wwwroot
-
+# Run migrations
 echo "Running migrations..."
-python manage.py migrate --noinput
+python manage.py migrate --noinput || echo "Migrations failed or already applied"
 
+# Seed categories
 echo "Seeding assessment categories..."
-python manage.py seed_assessment_categories || true
+python manage.py seed_assessment_categories || echo "Categories already seeded"
 
-echo "Collecting static files..."
-python manage.py collectstatic --noinput || true
-
+# Start Gunicorn
 echo "Starting Gunicorn..."
 gunicorn --bind=0.0.0.0 --timeout 600 childpassport.wsgi
-

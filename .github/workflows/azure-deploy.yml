@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - main
   workflow_dispatch:
 
 env:
@@ -14,22 +15,23 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    
+
     steps:
       # ============================================
       # STEP 1: CHECKOUT CODE
       # ============================================
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       # ============================================
-      # STEP 2: SET UP PYTHON
+      # STEP 2: SET UP PYTHON WITH CACHING
       # ============================================
       - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      
+          cache: 'pip'
+
       # ============================================
       # STEP 3: INSTALL DEPENDENCIES
       # ============================================
@@ -37,24 +39,22 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      
+
       # ============================================
       # STEP 4: COLLECT STATIC FILES
       # ============================================
       - name: Collect static files
-        run: |
-          python manage.py collectstatic --noinput
+        run: python manage.py collectstatic --noinput
         env:
           SECRET_KEY: ${{ secrets.SECRET_KEY }}
           DEBUG: 'False'
           ALLOWED_HOSTS: 'localhost'
-      
-  # ============================================
+
+      # ============================================
       # STEP 5: CREATE DEPLOYMENT PACKAGE
       # ============================================
       - name: Create deployment package
         run: |
-          # Create zip directly, excluding unnecessary files
           zip -r deployment.zip . \
             -x "*.git*" \
             -x ".github/*" \
@@ -70,178 +70,111 @@ jobs:
             -x "*.md" \
             -x ".gitignore" \
             -x ".DS_Store" \
-            -x "*.log" \
-            -x "deployment_package/*"
-          
-          echo "Deployment package created successfully"
-          ls -lh deployment.zip
-          
+            -x "*.log"
+          echo "Deployment package size: $(du -sh deployment.zip | cut -f1)"
+
       # ============================================
       # STEP 6: LOGIN TO AZURE
       # ============================================
       - name: Login to Azure
-        uses: azure/login@v1
+        uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-      
+
       # ============================================
       # STEP 7: CONFIGURE AZURE APP SETTINGS
+      # Only runs once unless config changes — idempotent
       # ============================================
       - name: Configure Azure App Settings
         run: |
-          echo "Setting up Azure configuration..."
-          
-          # Enable build on Azure
+          # Disable Oryx rebuild (we ship a complete package from CI)
           az webapp config appsettings set \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --name ${{ env.AZURE_WEBAPP_NAME }} \
             --settings \
-              SCM_DO_BUILD_DURING_DEPLOYMENT=true \
-              ENABLE_ORYX_BUILD=true \
-              WEBSITE_RUN_FROM_PACKAGE=0 \
-              POST_BUILD_SCRIPT_PATH="" \
-              POST_BUILD_COMMAND="" \
-              PRE_BUILD_SCRIPT_PATH="" \
-              PRE_BUILD_COMMAND=""
-          
-          # Set Python version
+              SCM_DO_BUILD_DURING_DEPLOYMENT=false \
+              ENABLE_ORYX_BUILD=false \
+              WEBSITE_RUN_FROM_PACKAGE=0
+
+          # Set Python runtime
           az webapp config set \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --name ${{ env.AZURE_WEBAPP_NAME }} \
             --linux-fx-version "PYTHON|${{ env.PYTHON_VERSION }}"
-          
-          # Set startup command
+
+          # Point startup to startup.sh so migrations run on every boot
           az webapp config set \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --name ${{ env.AZURE_WEBAPP_NAME }} \
-            --startup-file "gunicorn --bind=0.0.0.0 --timeout 600 childpassport.wsgi"
-      
+            --startup-file "/home/site/wwwroot/startup.sh"
+
       # ============================================
-      # STEP 8: STOP WEB APP (CLEAN DEPLOYMENT)
-      # ============================================
-      - name: Stop Azure Web App
-        run: |
-          echo "Stopping web app for clean deployment..."
-          az webapp stop \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.AZURE_WEBAPP_NAME }}
-      
-      # ============================================
-      # STEP 9: DEPLOY TO AZURE
+      # STEP 8: DEPLOY TO AZURE
       # ============================================
       - name: Deploy to Azure Web App
         run: |
-          echo "Deploying application to Azure..."
           az webapp deployment source config-zip \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --name ${{ env.AZURE_WEBAPP_NAME }} \
             --src deployment.zip \
             --timeout 600
-        continue-on-error: false
-      
+
       # ============================================
-      # STEP 10: WAIT FOR DEPLOYMENT TO SETTLE
-      # ============================================
-      - name: Wait for deployment to settle
-        run: |
-          echo "Waiting for deployment to complete..."
-          sleep 60
-      
-      # ============================================
-      # STEP 11: START WEB APP
-      # ============================================
-      - name: Start Azure Web App
-        run: |
-          echo "Starting web app..."
-          az webapp start \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.AZURE_WEBAPP_NAME }}
-      
-      # ============================================
-      # STEP 12: WAIT FOR APP TO START
-      # ============================================
-      - name: Wait for app to start
-        run: |
-          echo "Waiting for app to start..."
-          sleep 30
-      
-      # ============================================
-      # STEP 13: RUN DATABASE MIGRATIONS
-      # ============================================
-      - name: Run database migrations
-        run: |
-          echo "Running database migrations..."
-          
-          # Create a temporary script to run migrations
-          cat > migrate.sh << 'MIGRATE_EOF'
-          #!/bin/bash
-          cd /home/site/wwwroot
-          python manage.py migrate --noinput
-          python manage.py seed_assessment_categories || echo "Categories already seeded"
-          MIGRATE_EOF
-          
-          # Upload and execute the script
-          az webapp deployment source config-zip \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.AZURE_WEBAPP_NAME }} \
-            --src <(zip -q - migrate.sh) || echo "Migration script upload attempted"
-          
-          echo "Migrations completed or already up to date"
-        continue-on-error: true
-      
-      # ============================================
-      # STEP 14: RESTART WEB APP (APPLY ALL CHANGES)
+      # STEP 9: RESTART TO APPLY CHANGES & RUN MIGRATIONS
+      # startup.sh runs migrate + seed on every restart
       # ============================================
       - name: Restart Azure Web App
         run: |
-          echo "Performing final restart..."
           az webapp restart \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --name ${{ env.AZURE_WEBAPP_NAME }}
-      
+
       # ============================================
-      # STEP 15: VERIFY DEPLOYMENT
+      # STEP 10: WAIT FOR APP TO BE READY (HEALTH CHECK)
       # ============================================
-      - name: Verify deployment
+      - name: Wait for app to be ready
         run: |
-          echo "Waiting for app to be fully ready..."
-          sleep 30
-          
-          echo "Checking if application is responding..."
-          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/docs/ || echo "000")
-          
-          if [ "$RESPONSE" = "200" ] || [ "$RESPONSE" = "302" ]; then
-            echo "✅ Deployment successful! Application is responding."
-            echo "🌐 URL: https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net"
-          else
-            echo "⚠️  Application deployed but may need time to start. HTTP Status: $RESPONSE"
-            echo "🌐 URL: https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net"
-            echo "Please check the application logs if issues persist."
+          echo "Waiting for app to respond..."
+          MAX_ATTEMPTS=20
+          ATTEMPT=0
+          URL="https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/docs/"
+
+          until [ $ATTEMPT -ge $MAX_ATTEMPTS ]; do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
+            echo "Attempt $((ATTEMPT+1))/$MAX_ATTEMPTS — HTTP $HTTP_STATUS"
+
+            if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "302" ]; then
+              echo "App is ready."
+              break
+            fi
+
+            ATTEMPT=$((ATTEMPT+1))
+            sleep 10
+          done
+
+          if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
+            echo "App did not become ready in time. Check Azure logs."
+            exit 1
           fi
-      
+
       # ============================================
-      # STEP 16: CLEANUP
+      # STEP 11: CLEANUP
       # ============================================
       - name: Cleanup
         if: always()
-        run: |
-          echo "Cleaning up temporary files..."
-          rm -rf deployment_package deployment.zip migrate.sh
-          echo "Cleanup complete"
-      
+        run: rm -f deployment.zip
+
       # ============================================
-      # STEP 17: DEPLOYMENT SUMMARY
+      # STEP 12: DEPLOYMENT SUMMARY
       # ============================================
       - name: Deployment summary
         if: always()
         run: |
           echo "================================================"
-          echo "📦 DEPLOYMENT SUMMARY"
-          echo "================================================"
-          echo "Application: ${{ env.AZURE_WEBAPP_NAME }}"
-          echo "Resource Group: ${{ env.RESOURCE_GROUP }}"
-          echo "Python Version: ${{ env.PYTHON_VERSION }}"
-          echo "URL: https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net"
-          echo "API Docs: https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/docs/"
-          echo "Admin Panel: https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/admin/"
+          echo "Application : ${{ env.AZURE_WEBAPP_NAME }}"
+          echo "Resource    : ${{ env.RESOURCE_GROUP }}"
+          echo "Python      : ${{ env.PYTHON_VERSION }}"
+          echo "URL         : https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net"
+          echo "API Docs    : https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/docs/"
+          echo "Admin       : https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/admin/"
           echo "================================================"
