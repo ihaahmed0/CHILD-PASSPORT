@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework_simplejwt',
     'drf_spectacular', 
+    'storages',
     'accounts',
     'schools',
     'children',
@@ -204,7 +205,7 @@ if USE_AZURE_STORAGE:
     # Use Azure Blob Storage for media files
     AZURE_ACCOUNT_NAME = os.getenv('AZURE_ACCOUNT_NAME')
     AZURE_ACCOUNT_KEY = os.getenv('AZURE_ACCOUNT_KEY')
-    AZURE_CONTAINER = os.getenv('AZURE_CONTAINER', 'media')
+    AZURE_CONTAINER = os.getenv('AZURE_CONTAINER_NAME', os.getenv('AZURE_CONTAINER', 'media'))
     
     # Configure storage backend
     DEFAULT_FILE_STORAGE = 'storages.backends.azure_storage.AzureStorage'
